@@ -1,69 +1,79 @@
 package ami
 
 import (
-	"fmt"
+	"bufio"
 	"net"
 	"sync"
 )
 
-type (
-	Message map[string][]string
-)
+type ActionID uint64
 
-type Conn interface {
-	Do(action interface{}, response interface{}) error
-	// List(action interface{}, response interface{}, list interface{}) error
+// An AMI-returned `Response: Error`, containing the value of Message
+type AMIErrorResponse string
 
-	// Action(action string, m Message) (<-chan Message, error)
-	// Subscribe(event string, ch chan<- Message)
-	// Unsubscribe(event string, ch chan<- Message)
-	Close() error
+func (e AMIErrorResponse) Error() string {
+	return string(e)
 }
 
-type conn struct {
-	c  *net.TCPConn
-	id struct {
-		id int
-		mu sync.Mutex
-	}
+type Conn struct {
+	c *net.TCPConn
+	s *bufio.Scanner
+
+	// Last used ActionID for this connection (lock, inc, take, unlock)
+	idmu sync.Mutex
+	id   ActionID
 }
 
-func Dial(addr string) (Conn, error) {
-	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+// Dial sets up an AMI connection to the given address. The address can
+// contain a port, and will fall back to port 5038 if none is given.
+func Dial(address string) (*Conn, error) {
+	tcpAddr, err := net.ResolveTCPAddr("tcp", address)
 	if err != nil {
-		tcpAddr, err = net.ResolveTCPAddr("tcp", addr+":5038")
+		tcpAddr, err = net.ResolveTCPAddr("tcp", address+":5038")
 	}
 	if err != nil {
 		return nil, err
 	}
-	c := &conn{}
-	c.c, err = net.DialTCP("tcp", nil, tcpAddr)
+	return dialTCP(tcpAddr)
+}
+
+func dialTCP(address *net.TCPAddr) (*Conn, error) {
+	c := &Conn{}
+	var err error
+	c.c, err = net.DialTCP("tcp", nil, address)
 	if err != nil {
 		return nil, err
+	}
+	c.s = bufio.NewScanner(c.c)
+	c.s.Scan()
+	if c.s.Text() != "Asterisk Call Manager/1.3" {
+		c.Close()
+		return nil, AMIErrorResponse("unexpected AMI identification string: " + c.s.Text())
 	}
 	return c, nil
 }
 
-func (c *conn) Do(action interface{}, response interface{}) error {
-	c.id.mu.Lock()
-	c.id.id += 1
-	id := c.id.id
-	c.id.mu.Unlock()
+// Send an Action message through this AMI connection. Action should be a
+// struct from a named type, with exported fields for each valuein the Action.
+// The struct fields should be of string or integer types.
+func (c *Conn) Send(action interface{}) (ActionID, error) {
+	c.idmu.Lock()
+	c.id += 1
+	id := c.id
+	c.idmu.Unlock()
 	b, err := marshalAction(action, id)
 	if err != nil {
-		return err
+		return id, err
 	}
-	fmt.Println(string(b))
-	return nil
+	//TODO: move this to a central dispatch?
+	_, err = c.c.Write(b)
+	if err != nil {
+		//TODO: close/reconnect/whatever
+		return id, err
+	}
+	return id, nil
 }
 
-// func (c *conn) Action(action string, m Message) (<-chan Message, error) {
-// 	return nil, nil
-// }
-
-// func (c *conn) Subscribe(event string, ch chan<- Message)   {}
-// func (c *conn) Unsubscribe(event string, ch chan<- Message) {}
-
-func (c *conn) Close() error {
+func (c *Conn) Close() error {
 	return c.c.Close()
 }
